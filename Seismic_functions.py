@@ -11,6 +11,7 @@ from obspy.geodetics.base import kilometer2degrees
 from geopy.distance import geodesic
 from geopy.point import Point
 import math
+from scipy.stats import dirichlet
 
 """
 Assumes you have a local Syngine database!
@@ -380,8 +381,22 @@ class Seismogram:
 #dip = 30     # degrees
 #slip = 90    # degrees
 def make_EQ_tensor_EMB(strike, dip, slip):
-    # Calculate the tensor terms for an arbitrarily oriented double couple EQ given
-    # strike, dip, and slip angles (in degrees)
+    '''
+    Calculate the tensor terms for an arbitrarily oriented double couple EQ given
+    strike, dip, and slip angles (in degrees)
+
+    from Modern Global Seismology. Thorne Lay & Terry C. Wallace. Pg 343.
+    NOTE: slip=rake
+    
+    Parameters
+    ----------
+    strike, dip, slip: strike,dip, and slip parameters in degrees
+
+    Returns
+    ----------
+    M : np.array
+        3x3 moment tensor
+    '''
 
     # Convert to radians
     delta = np.radians(dip)
@@ -411,7 +426,7 @@ def make_EQ_tensor_EMB(strike, dip, slip):
     return M
 
 
-def generate_moment_tensor(strike=None, dip=None, slip=None):
+def generate_moment_tensor(strike=None, dip=None, slip=None, MT_components=[1,1,1]):
     """
     Generate a synthetic moment tensor based on ISO, CLVD, and DC components.
 
@@ -425,7 +440,9 @@ def generate_moment_tensor(strike=None, dip=None, slip=None):
     """
 
     # Step 1: Sample ISO, CLVD, DC weights
-    weights = np.random.dirichlet([1, 1, 8])  # Adjust alpha parameters for different distributions
+    #weights = dirichlet.rvs(alpha=[1,1,1], size=1)[0]
+    weights = dirichlet.rvs(alpha=MT_components, size=1)[0]
+    #weights = np.random.dirichlet([1, 1, 8])  # Adjust alpha parameters for different distributions
     w_iso, w_clvd, w_dc = weights
 
     # Step 2: Define base components
@@ -455,11 +472,11 @@ def generate_moment_tensor(strike=None, dip=None, slip=None):
         w_dc * dc_component
     )
 
-    # Use this to scale moment tensor if desired
     # Step 6: Sample moment magnitude (Mw) and compute seismic moment (M0)
     # Mw = np.random.uniform(3.5, 8.5)  # Adjust range as needed
     #Mw = 5
     #M0 = 10 ** (1.5 * Mw + 9.1)
+    # M0 = 1
 
     # Step 7: Scale the moment tensor
     #moment_norm = np.sqrt(0.5 * np.sum(moment_tensor**2))  # Frobenius norm
@@ -468,3 +485,253 @@ def generate_moment_tensor(strike=None, dip=None, slip=None):
     #return moment_tensor_scaled
     return moment_tensor
 
+def generate_latlon_list(lat_start, lat_end, lon_start, lon_end, step):
+    """
+    Generate a list of (lat, lon) tuples over a regular grid.
+
+    Parameters:
+        lat_start, lat_end: float
+            Latitude bounds (inclusive)
+        lon_start, lon_end: float
+            Longitude bounds (inclusive)
+        step: float
+            Step size in degrees
+
+    Returns:
+        List[Tuple[float, float]]: List of (lat, lon) coordinate pairs
+    """
+    lat_vals = np.arange(lat_start, lat_end + step, step)
+    lon_vals = np.arange(lon_start, lon_end + step, step)
+    return [(lat, lon) for lat in lat_vals for lon in lon_vals]
+
+def generate_latlon_df(lat_start, lat_end, lon_start, lon_end, step):
+    """
+    Generate a DataFrame of lat/lon grid points.
+
+    Parameters:
+        Same as generate_latlon_list
+
+    Returns:
+        pd.DataFrame with columns ['lat', 'lon']
+    """
+    lat_vals = np.arange(lat_start, lat_end + step, step)
+    lon_vals = np.arange(lon_start, lon_end + step, step)
+    lat_grid, lon_grid = np.meshgrid(lat_vals, lon_vals, indexing='ij')
+    return pd.DataFrame({
+        'lat': lat_grid.ravel(),
+        'lon': lon_grid.ravel()
+    })
+
+def repeat_latlon_pairs(latlon_list, n_samples):
+    """
+    Repeat arbitrary (lat, lon) pairs n_samples times each.
+
+    Parameters:
+        latlon_list: list of (lat, lon) tuples
+        n_samples: int, number of samples per location
+
+    Returns:
+        lat_array, lon_array: np.arrays with length len(latlon_list) * n_samples
+    """
+    lat_vals = []
+    lon_vals = []
+    for lat, lon in latlon_list:
+        lat_vals.extend([lat] * n_samples)
+        lon_vals.extend([lon] * n_samples)
+    return np.array(lat_vals), np.array(lon_vals)
+
+def signed_azimuth_difference(source, locA, locB):
+    """
+    Compute the signed angle from *A to B* with respect to a common source (in degrees).
+    Positive = counterclockwise rotation. If either location is the same as the source,
+    return 0.0 (no angular difference defined).
+    """
+
+    def to_unit_vector(lat, lon):
+        lat_rad = np.radians(lat)
+        lon_rad = np.radians(lon)
+        x = np.cos(lat_rad) * np.cos(lon_rad)
+        y = np.cos(lat_rad) * np.sin(lon_rad)
+        z = np.sin(lat_rad)
+        return np.array([x, y, z])
+
+    src = to_unit_vector(*source)
+    vecA = to_unit_vector(*locA) - src
+    vecB = to_unit_vector(*locB) - src
+
+    normA = np.linalg.norm(vecA)
+    normB = np.linalg.norm(vecB)
+
+    if normA < 1e-10 or normB < 1e-10:
+        return 0.0  # Defined as zero angle if one of the locations is the source
+
+    vecA /= normA
+    vecB /= normB
+
+    cross = np.cross(vecA, vecB)
+    dot = np.dot(vecA, vecB)
+    sign = np.sign(np.dot(src, cross))  # +1 or -1 depending on direction
+    angle = np.arccos(np.clip(dot, -1.0, 1.0))
+
+    return np.degrees(angle) * sign
+
+def compute_distance_from_source(receiver_latlon, source_latlon=(0, 0)):
+    """
+    Computes the great-circle distance in degrees between a receiver and a source.
+
+    Parameters:
+    - receiver_latlon: (lat, lon) tuple of the receiver
+    - source_latlon: (lat, lon) tuple of the source, default is (0, 0)
+
+    Returns:
+    - distance in degrees
+    """
+    distance_km = great_circle(source_latlon, receiver_latlon).kilometers
+    distance_deg = distance_km / 111.195  # Convert km to degrees (approx)
+    return distance_deg
+
+def generate_dataset_shared_latents_truth(
+    fixed_locations,
+    depth,
+    num_samples=50,
+    sliprate_range=(1,3),
+    MT_components=[1,1,1]):
+    """
+    Generates a dataset for GP-based correlation analysis at fixed locations,
+    sharing the same set of latent variables (moment tensor + variance)
+    across all fixed locations.
+
+    Parameters:
+    - fixed_locations: list of tuples [(lat,lon)...]
+    - num_samples: number of moment tensor and variance samples per location
+    - generate_moment_tensor_func: function to generate a moment tensor
+    - depths: list of integers to indicate depth in meters of the seismic event 
+    - sliprate_range: tuple (min_var, max_var)
+    - MT_components (list of three positive float values) for the relative proportion of iso, clvd, and dc 
+    components in the moment tensor. The proportion of each is simulated from a Dirichlet distribution. See 
+    SeismicUtils.generate_moment_tensor()
+
+    Returns:
+    - DataFrame with input features, max mag and log of max mag
+    """   
+
+    # get distance in degrees from location to source, assumed to be at 0,0
+    dists = []
+    for i in fixed_locations:
+        dist = compute_distance_from_source(i)
+        dists.append(dist)
+    # get azimuth
+    angles = compute_azimuths_from_source(fixed_locations)
+
+    # generate latent variables that we want to marignalize over: sliprate variances and moment tensors
+    latent_samples = []
+    for _ in range(num_samples):
+        moment_tensor = generate_moment_tensor(MT_components=MT_components)
+        gaussian_variance = np.random.uniform(*sliprate_range)
+        #gaussian_variance = 2
+        latent_samples.append((moment_tensor, gaussian_variance))
+    
+    data = []
+    for i in range(len(fixed_locations)):
+        
+        my_azimuth = angles[i]
+        theta = np.radians(my_azimuth)
+        distance_in_degrees = dists[i]
+           
+        for moment_tensor, gaussian_variance in latent_samples:
+            R = np.array([
+                [np.cos(theta), -np.sin(theta), 0],
+                [np.sin(theta),  np.cos(theta), 0],
+                [0, 0, 1]
+            ])
+            M_rotated = R @ moment_tensor @ R.T
+            my_moment_tensor = M_rotated
+
+                
+            seis_obj = Seismogram()
+            seis_obj.depth_in_m = depth
+            seis_obj.dist_in_degrees = distance_in_degrees
+            seis_obj.sliprate = "Gauss"
+            seis_obj.moment_tensor = my_moment_tensor
+
+            seis_obj.custom_seismogram(variance=gaussian_variance)
+            seis_obj.get_response(resp="VEL")
+            mag = seis_obj.compute_integrated_signal_power()
+            #mag = seis_obj.compute_maximum_magnitude(data_type="VEL")
+    
+            # store input dataset
+            data.append({
+                "Depth": depth,
+                "Distance_in_degrees": distance_in_degrees,
+                "Gaussian_variance": gaussian_variance,
+                "m_rr": my_moment_tensor[0, 0],
+                "m_tt": my_moment_tensor[1, 1],
+                "m_pp": my_moment_tensor[2, 2],
+                "m_rt": my_moment_tensor[0, 1],
+                "m_rp": my_moment_tensor[0, 2],
+                "m_tp": my_moment_tensor[1, 2],
+                "max_mag": mag,
+                "log_max_mag": np.log(mag)
+            })
+    data = pd.DataFrame(data)
+    lat, lon = repeat_latlon_pairs(fixed_locations, num_samples)
+    data['lat'] = lat
+    data['lon'] = lon
+    return pd.DataFrame(data)
+
+
+
+
+def make_augmented_df(num_reps=30, num_azimuths=20, num_distances=10):
+    '''
+    This function sets up the skeleton for making an augmented GP dataset where moment tensors
+    are rotated according to azimuth
+    Parameters
+    ----------
+    num_reps: number of unique depths and Gaussian sliprate variances to sample
+    num_azimuths: number of azimuths per fixed location
+    num_distances: number of distances per depth
+
+    Returns
+    -----------
+    a pandas DataFrame with rows equal to num_reps * num_azimuths * num_distances
+    '''
+    
+    # Randomly sample depths
+    depths = np.random.uniform(1000, 40000, num_reps)
+    
+    # Define azimuths
+    azimuths = np.linspace(0, 360, num_azimuths, endpoint=False)
+    
+    # Randomly sample distances in degrees to source
+    distances = np.linspace(0,3, num_distances)
+    
+    variances = np.random.uniform(1, 3, num_reps)
+    
+    # Create a DataFrame with all combinations
+    depths_repeated = np.repeat(depths, len(azimuths) * len(distances))
+    azimuths_repeated = np.tile(np.repeat(azimuths, len(distances)), len(depths))
+    distances_repeated = np.tile(distances, len(depths) * len(azimuths))
+    variances_repeated = np.repeat(variances, len(azimuths) * len(distances))
+    
+    # Create a DataFrame
+    df = pd.DataFrame({
+        'Depth (m)': depths_repeated,
+        'Azimuth (degrees)': azimuths_repeated,
+        'Distance (degrees)': distances_repeated,
+        'Gaussian_variance': variances_repeated
+    })
+
+    return df
+
+def calculate_receiver_location_geopy(lat, lon, azimuth, distance_degrees):
+    # Create a point for the source location
+    source_point = Point(lat, lon)
+    
+    # Convert distance from degrees to kilometers
+    distance_kilometers = distance_degrees * 111.32  # Convert degrees to kilometers
+    
+    # Calculate the destination point using geodesic
+    destination_point = geodesic(kilometers=distance_kilometers).destination(source_point, azimuth)
+    
+    return destination_point.latitude, destination_point.longitude
